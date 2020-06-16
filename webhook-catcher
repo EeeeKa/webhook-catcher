@@ -1,0 +1,646 @@
+#!/usr/bin/python3
+
+#
+# Webhook-catcher v1.0
+#
+
+import os
+import sys
+import subprocess
+
+from http.server import BaseHTTPRequestHandler
+
+# Python v3.7+
+if sys.version_info.major == 3 and sys.version_info[1] > 7:
+  from http.server import ThreadingHTTPServer as _HTTPServer
+# Python v3.5+
+elif sys.version_info.major == 3 and sys.version_info[1] > 5:
+  from http.server import HTTPServer as _HTTPServer
+# Fallback
+else:
+  from http.server import HTTPServer as _HTTPServer
+
+import json
+import argparse
+
+import hmac
+import hashlib
+import base64
+
+from signal import signal, SIGHUP, SIGTERM
+
+from pprint import pprint
+
+PROG_NAME = "Webhook-catcher"
+PROG_VERSION = "v1.0"
+PROG_DESCRIPTION = '\
+  Simple HTTP-server for processing webhooks from Github or Gogs portals.\n\
+  \n\
+  You may define one repo by arguments:\n\
+    --dir, --secret, --branch, --remote, --action, --full_name, --clone_proto\n\
+  define "wild" dir, using:\n\
+    --wild_dir, --wild_secret, --wild_proto\n\
+  specify configuration file in .json format:\n\
+    -c|--config\n\
+  or mix them all.\n\
+  \n\
+  "wild" directory will be used to pull all repos which not defined in config\n\
+  or arguments. No actions allowed for wild repos.\n\
+  \n\
+  If repo directory does not exists, it will be cloned at first hook.\n\
+  \n\
+  Repos identifyed by "full_name", so if more then one repo defined, you must\n\
+  define "full_name" to all of them.\n\
+  \n\
+  You may send SIGHUP to restart server with same arguments and re-read config\n\
+  if it supplied.\n\
+  \n\
+  Also, server will be restarted after successfull pulling repo which defined\n\
+  as "self_update_repo" in config file.'
+
+PROG_EPILOG='Good luck!'
+
+# DEFAULTS
+DEFAULT_ADDRESS = "0.0.0.0"
+DEFAULT_PORT = 8888
+DEFAULT_REMOTE = "origin"
+DEFAULT_BRANCH = "master"
+DEFAULT_PROTO = "http"
+
+class WebHookServer(_HTTPServer):
+
+  def __init__(self, server_address, request_handler_class, repos, self_update_repo, wild_dir, wild_proto, wild_secret):
+    repos_count = 0
+    if repos != []:
+      for repo in repos:
+        repos_count += 1
+
+    self.repos = repos
+    self.self_update_repo = self_update_repo
+    self.repos_count = repos_count
+    self.wild_dir = wild_dir
+    self.wild_proto = wild_proto
+    self.wild_secret = wild_secret
+
+    super().__init__(server_address, request_handler_class)
+
+
+class WebHookHandler(BaseHTTPRequestHandler):
+  def __init__(self, request, client_address, server):
+    self.json_response = {
+        "webhook": {
+          "status": "",
+          "message": "",
+          "signature_status": ""
+        },
+
+        "pull": {
+          "return_code": -1,
+          "status": "",
+          "stdout": "",
+          "stderr": "",
+        },
+
+        "action": {
+          "return_code": -1,
+          "status": "ND",
+          "stdout": "NA",
+          "stderr": "NA",
+        }
+      }
+
+    super().__init__(request, client_address, server)
+
+  def do_GET(self):
+    self.send_response(401)
+    self.send_header('Content-type', 'text/plain')
+    self.end_headers()
+    self.wfile.write('Webhook Catcher supports POST-queries only. Bye!'.encode('UTF-8'))
+
+  def _send_json_response(self, code):
+    self.send_response(code)
+    self.send_header('Content-type', 'application/json')
+    self.end_headers()
+    self.wfile.write(json.dumps(self.json_response, indent=2, sort_keys=True).encode('UTF-8', 'replace'))
+
+
+  def do_POST(self):
+    # GET SIGNATURE
+    signature = None
+    signature_type = ''
+
+    signature = self.headers['X-Hub-Signature']
+    if signature is not None:
+      signature_type = 'Hub'
+    else:
+      signature = self.headers['X-Gogs-Signature']
+      if signature is not None:
+        signature_type = 'Gogs'
+
+    if signature is None:
+      self.json_response.update({
+          "webhook": {
+            "status": "ERROR",
+            "message": "No signature found.",
+            "signature_status": "NOT FOUND"
+          }
+        })
+
+      self._send_json_response(400)
+      return
+
+    # GET DATA
+    data_raw = self.rfile.read1(10240)
+
+    ## Process data
+    data = json.loads(data_raw.decode('UTF-8'))
+    
+    try:
+      requested_full_name = data['repository']['full_name'] 
+      http_clone_url = data['repository']['clone_url']
+      ssh_clone_url = data['repository']['ssh_url']
+    except:
+      self.json_response.update({
+         "webhook": {
+            "status": "ERROR",
+            "message": "No valid data found.",
+            "signature_status": "NOT_VALIDATED"
+           }
+        })
+
+      self._send_json_response(401)
+      return
+
+    current_repo = {}
+
+    # Try to find suitable repo definition
+    if self.server.repos_count > 1:
+      for repo in self.server.repos:
+        if repo['full_name'] == requested_full_name:
+          current_repo = repo
+    elif self.server.repos != []:
+      current_repo = self.server.repos[0]
+
+    # Use wild dir if no defined repo found
+    if current_repo == {} and self.server.wild_dir != '':
+      current_repo = {
+          'name': data['repository']['name'],
+          'branch': data['repository']['default_branch'],
+          'remote': DEFAULT_REMOTE,
+          'dir': os.path.join(self.server.wild_dir, data['repository']['name']),
+          'action': '',
+          'clone_proto': DEFAULT_PROTO,
+          'full_name': data['repository']['full_name'],
+          'secret': self.server.wild_secret
+        }
+
+    if current_repo != {}:
+      # SET URL
+      if current_repo['clone_proto'].upper() == 'HTTP':
+        current_repo['url'] = http_clone_url
+      elif current_repo['clone_proto'].upper() == 'SSH':
+        current_repo['url'] = ssh_clone_url
+      else:
+        current_repo['url'] = ''
+
+      pdm('Current repo:')
+      pdm(current_repo)
+
+      # CHECK SIGNATURE
+      if current_repo['secret'] != '':
+        if signature_type == 'Hub':
+          data_hash = hmac.new(current_repo['secret'].encode(), data_raw, hashlib.sha1).hexdigest()
+        elif signature_type == 'Gogs':
+          data_hash = hmac.new(current_repo['secret'].encode(), data_raw, hashlib.sha256).hexdigest()
+
+        if signature != data_hash:
+          self.json_response.update({
+              "webhook": {
+                "status": "ERROR",
+                "message": "Invalid Signature. Check secret phrase.",
+                "signature_status": "INVALID"
+              }
+            })
+
+          self._send_json_response(401)
+          return
+
+        # CHECK SUCCESSFULL
+        self.json_response.update({
+            "webhook": {
+              "status": "OK",
+              "message": "WebHook captured successfully.",
+              "signature_status": "VALID"
+            }
+          })
+
+      else:
+        # CHECK SKIPPED
+        self.json_response.update({
+            "webhook": {
+              "status": "OK",
+              "message": "WebHook captured successfully.",
+              "signature_status": "CHECK_SKIPPED"
+            }
+          })
+ 
+     
+      # DO WORK
+
+      code = 0
+      pull_status = ''
+      action_status = ''
+
+      ## Pull
+      try:
+        pull_result = WebHookWorker.git_pull(current_repo)
+      except FileNotFoundError as e:
+        code = 500
+        self.json_response.update({
+            "pull": {
+              "return_code": -1,
+              "status": str(e),
+              "stdout": "",
+              "stderr": ""
+            }
+          })
+      else:
+        pdm(pull_result)
+
+        if pull_result.returncode == 0:
+          code = 200
+          pull_status = "DONE"
+        else:
+          code = 500
+          pull_status = "ERROR"
+
+        self.json_response.update({
+            "pull": {
+              "return_code": pull_result.returncode,
+              "status": pull_status,
+              "stdout": pull_result.stdout,
+              "stderr": pull_result.stderr
+            }
+          })
+
+        ## Action
+        if current_repo['action'] != '' and pull_result.returncode == 0:
+          try:
+            action_result = WebHookWorker.do_action(current_repo)
+          except Exception as e:
+            code = 500
+            self.json_response.update({
+                "action": {
+                  "return_code": -1,
+                  "status": str(e),
+                  "stdout": "",
+                  "stderr": ""
+                }
+              })
+          else:
+            pdm(action_result)
+
+            if action_result.returncode == 0:
+              code = 200
+              action_status = "DONE"
+            else:
+              code = 500
+              action_status = "ERROR"
+
+            self.json_response.update({
+                "action": {
+                  "return_code": action_result.returncode,
+                  "status": action_status,
+                  "stdout": action_result.stdout,
+                  "stderr": action_result.stderr
+                }
+              })
+
+    else:
+      ### NOTHING TO DO PREPARE EMPTY RESPONSE
+      code = 500
+      pull_status = "NO SUITABLE REPO DEFINED. NOTHING TO DO."
+      self.json_response.update({
+          "webhook": {
+            "status": "OK",
+            "message": "WebHook captured successfully.",
+            "signature_status": "CHECK_SKIPPED"
+          },
+          "pull": {
+            "return_code": "NA",
+            "status": pull_status,
+            "stdout": "NA",
+            "stderr": "NA"
+          }
+        })
+ 
+    # SEND RESPONSE
+    self._send_json_response(code)
+    
+    # SELF-UPDATE
+    if code == 200 and current_repo['name'] == self.server.self_update_repo:
+      pm('Self update complete.')
+      os.kill(os.getpid(), SIGHUP)
+      
+
+class WebHookWorker(object):
+
+  @classmethod
+  def git_pull(cls, repo):
+    if os.path.isdir(repo['dir']):
+      result = subprocess.run([
+          "git", "--git-dir", os.path.join(repo['dir'], '.git'), "pull",
+          repo['remote'], repo['branch'],
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+    else:
+      result = subprocess.run([
+          "git", "clone", "--origin", repo['remote'], "--branch", repo['branch'], repo['url'], repo['dir']
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    return result
+
+  @classmethod
+  def do_action(cls, repo):
+    result = subprocess.run(repo['action'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+    return result
+
+def create_arg_parser():
+  arg_parser = argparse.ArgumentParser(description=PROG_DESCRIPTION, epilog=PROG_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+  arg_parser.add_argument('-c', '--config', default={}, metavar='CONFIG_PATH', type=load_config, help='path to configuration file')
+
+  arg_parser.add_argument('-a', '--address', metavar='LISTEN_ADDRESS', help='listen address, default: ' + DEFAULT_ADDRESS)
+  arg_parser.add_argument('-p', '--port', metavar='LISTEN_PORT', help='port, default: ' + str(DEFAULT_PORT))
+
+  arg_parser.add_argument('-q', '--quiet', action='store_const', const=True, help='don''t show any messages')
+  arg_parser.add_argument('--debug', action='store_const', const=True, help='show debug messages')
+
+  arg_parser.add_argument('--wild_dir', metavar='PATH_TO_DIR', help='clone/pull all unhandled requests into this dir')
+  arg_parser.add_argument('--wild_secret', metavar='SECRET', help='secret phrase')
+  arg_parser.add_argument('--wild_proto', metavar='<HTTP|SSH>', choices=['http', 'ssh', 'HTTP', 'SSH'], help='which protocol will be used to clone wild repos, default: ' + DEFAULT_PROTO)
+
+  arg_parser.add_argument('--dir', metavar='PATH_TO_REPO', help='path to git repo')
+  arg_parser.add_argument('--secret', default='', metavar='SECRET', help='secret phrase')
+  arg_parser.add_argument('--branch', default=DEFAULT_BRANCH, metavar='BRANCH_NAME', help='git branch name, default: ' + DEFAULT_BRANCH)
+  arg_parser.add_argument('--remote', default=DEFAULT_REMOTE, metavar='REMOTE_NAME', help='git remote name, default: ' + DEFAULT_REMOTE)
+  arg_parser.add_argument('--action', default='', metavar='ACTION', help='execute additional actions after "git pull"')
+  arg_parser.add_argument('--full_name', default='', metavar='FULL_NAME', help='repo fullname')
+  arg_parser.add_argument('--clone_proto', default='http', metavar='<HTTP|SSH>', choices=['http', 'ssh', 'HTTP', 'SSH'], help='which protocol will be used to clone repo, default: ' + DEFAULT_PROTO)
+
+  arg_parser.add_argument('--version', action='version', version=PROG_NAME + ' ' + PROG_VERSION)
+
+  return(arg_parser)
+
+class MessagePrinter:
+  def __init__(self, quiet, debug):
+    self.quiet = quiet
+    self.debug = debug
+
+  def pm(self, message):
+    if not self.quiet:
+      print(message)
+
+  def pdm(self, debug_message):
+    if self.debug:
+      pprint(debug_message)
+
+def load_config(path):
+  if path != '':
+    try:
+      f = open(path, 'r')
+    except FileNotFoundError as e:
+      raise argparse.ArgumentTypeError(str(e))
+    else:
+      try:
+        config = json.loads(f.read())
+      except Exception as e:
+        raise argparse.ArgumentTypeError(str(e))
+      else:
+        return config
+      finally:
+        f.close()
+
+  return {}
+
+def prepare_repos(repos, self_update_repo):
+  # FILL AND CHECK
+  count = 0
+  no_full_name_count = 0
+  self_update_repo_found = False
+  names = []
+  full_names = []
+
+  for repo in repos:
+    count += 1
+    
+    # self_update_repo
+    if (self_update_repo != '') and (repo['name'] == self_update_repo):
+      self_update_repo_found = True
+
+    # name
+    if not 'name' in repo:
+      repo['name'] = 'Repo ' + count
+
+    # branch
+    if not 'branch' in repo:
+      repo['branch'] = DEFAULT_BRANCH
+
+    # remote
+    if not 'remote' in repo:
+      repo['remote'] = DEFAULT_REMOTE
+
+    # dir
+    if (not 'dir' in repo) or (repo['dir'] == ''):
+      pm('ERROR: Destination directory not defined in repo "{}".'.format(repo['name']))
+      exit(5)
+    elif (not os.path.isdir(repo['dir']) and not os.path.isdir(os.path.dirname(repo['dir']))):
+      pm('ERROR: Destination directory "{}" or parent directory "{}" defined in repo "{}" not found.'.format(repo['dir'], os.path.dirname(repo['dir']), repo['name']))
+      exit(6)
+    elif os.path.isfile(repo['dir']):
+      pm('ERROR: Destination path "{}" is not a directory in repo "{}".'.format(repo['dir'], repo['name']))
+      exit(7)
+ 
+    # action
+    if (not 'action' in repo) or (repo['action'] == ''):
+      repo['action'] = ''
+    else:
+      action_file = repo['action'].split(' -')[0]
+      if not (os.path.isfile(action_file) and os.access(action_file, os.X_OK)):
+        pm('ERROR: Defined action file "{}" in repo "{}" not found or not executable.'.format(action_file, repo['name']))
+        exit(4)
+
+    # ACTION FOR SELF UPDATE IS OPTIONAL
+    #if (self_update_repo != '') and (repo['name'] == self_update_repo) and (repo['action'] == ''):
+    #  pm('ERROR: No action defined in self update repo "{}".'.format(repo['name']))
+    #  exit(11)
+
+    # clone_proto
+    if not 'clone_proto' in repo:
+      repo['clone_proto'] = DEFAULT_PROTO
+    elif not repo['clone_proto'].upper() in ['HTTP', 'SSH']:
+      pm('ERROR: Wrong protocol "{}" in repo "{}". "HTTP" or "SSH" expected.'.format(repo['clone_proto'], repo['name']))
+      exit(2)
+
+    # full_name
+    if (not 'full_name' in repo) or (repo['full_name'] == ''):
+      repo['full_name'] = ''
+      no_full_name_count += 1
+    if (count > 1) and (no_full_name_count > 0):
+      pm('ERROR: Count of repos without "full_name" more then one. "full_name" must be set for all repos.')
+      exit(3)
+
+    # secret
+    if not 'secret' in repo:
+      repo['secret'] = ''
+
+    # unique names
+    if repo['name'] in names:
+      pm('ERROR: Not unique repo name: "{}".'.format(repo['name']))
+      exit(9)
+    else:
+      names.append(repo['name'])
+
+    if repo['full_name'] in full_names:
+      pm('ERROR: Not unique full_name "{}" in repo "{}".'.format(repo['full_name'], repo['name']))
+      exit(10)
+    else:
+      full_names.append(repo['full_name'])
+
+
+  if self_update_repo != '' and not self_update_repo_found:
+    pm('ERROR: Repo for self update "{}" defined but not found!'.format(self_update_repo))
+    exit(8)
+
+def restart_catcher(signalNumber, frame):
+  pm('Restart...')
+  os.execl(sys.executable, sys.executable, *sys.argv)
+  
+def stop_catcher(signalNumber, frame):
+  pm('Terminating...')
+  exit(0)
+
+# MAIN
+def main(port=DEFAULT_PORT, key=''):
+  # INIT
+  global pm
+  global pdm
+
+  arg_parser = create_arg_parser()
+  args = arg_parser.parse_args()
+
+  signal(SIGHUP, restart_catcher)
+  signal(SIGTERM, stop_catcher)
+
+  # SERVER SETTINGS
+  address = ''
+  port = ''
+  quiet = False
+  debug = False
+  wild_dir = ''
+  wild_proto = ''
+  wild_secret = ''
+  self_update_repo = ''
+
+  repos = []
+
+  # LOAD FROM CONFIG
+  if 'server' in args.config:
+    if 'address' in args.config['server']: address = args.config['server']['address']     
+    if 'port' in args.config['server']: port = args.config['server']['port']
+    if 'quiet' in args.config['server']: quiet = args.config['server']['quiet']
+    if 'debug' in args.config['server']: debug = args.config['server']['debug']
+    if 'wild_dir' in args.config['server']: wild_dir = args.config['server']['wild_dir']
+    if 'wild_proto' in args.config['server']: wild_proto = args.config['server']['wild_proto']
+    if 'wild_secret' in args.config['server']: wild_secret = args.config['server']['wild_secret']
+    if 'self_update_repo' in args.config['server']: self_update_repo = args.config['server']['self_update_repo']
+  
+  # OVERRIDE BY ARGS
+  if args.address is not None: address = args.address
+  if args.port is not None: port = args.port
+  if args.quiet is not None: quiet = args.quiet
+  if args.debug is not None: debug = args.debug
+  if args.wild_dir is not None: wild_dir = args.wild_dir
+  if args.wild_proto is not None: wild_proto = args.wild_proto  
+  if args.wild_secret is not None: wild_secret = args.wild_secret
+
+  # SET DEFAULT SERVER SETTINGS
+  if address == '': address = DEFAULT_ADDRESS
+  if port == '': port = DEFAULT_PORT
+
+  mp = MessagePrinter(args.quiet, args.debug)
+  pm = mp.pm
+  pdm = mp.pdm
+
+  # PRINT VERSION
+  pm(PROG_NAME + ' ' + PROG_VERSION)
+
+  # REPOS
+  if args.dir is not None:
+    repos.append({
+        'name': '**args_repo**',
+        'branch': args.branch,
+        'remote': args.remote,
+        'dir': args.dir,
+        'action': args.action,
+        'clone_proto': args.clone_proto,
+        'full_name': args.full_name,
+        'secret': args.secret    
+      })
+
+  if 'repos' in args.config:
+    repos += args.config['repos']
+
+  # PREPARE REPOS
+  if repos != []:
+    prepare_repos(repos, self_update_repo)
+
+  # CHECK WILD DIR
+  if wild_dir != '':
+    if not os.path.isdir(wild_dir):
+      pm('ERROR: Wild dir "{}" not exists.'.format(wild_dir))
+      exit(12)
+
+    pm('\nWild dir: ' + wild_dir)
+
+    if wild_secret == '':
+      pm('WARNING: No secret given for wild repos! Authentication disabled.')
+
+  # EXIT IF NO REPO OR WILD_DIR DEFINED 
+  if repos == [] and wild_dir == '':
+    pm('ERROR: No any repo, dir or wild_dir is defined. Nothing to do.')
+    exit(1)
+
+  # PREPARE SERVER
+  socket = (address, int(port))
+  httpd = WebHookServer(socket, WebHookHandler, repos, self_update_repo, wild_dir, wild_proto, wild_secret)
+  
+  # PRINT REPOS INFO
+  if repos != []: pm('\nDefined repos:')
+  for repo in repos:
+    pm('---=== ' + repo['name'] + ' ===---')
+    pm('Repository directory: {}'.format(repo['dir']))
+    pm('Will pull from branch "{}" of remote "{}" '.format(repo['branch'], repo['remote']))
+    if repo['action'] != '':
+      pm('Action: "{}"'.format(repo['action']))
+    if (not 'full_name' in repo) or (repo['full_name'] == ''):
+      pm('WARNING: Repo full name not set. Name check disabled')
+    if (not 'secret' in repo) or (repo['secret'] == ''):
+      pm('WARNING: No secret given! Authentication disabled.')
+
+  if self_update_repo != '':
+    pm('\nSelf update repo: {}'.format(self_update_repo))
+
+  # START SERVER
+  pm('\nPID: ' + str(os.getpid()))
+  pm('Listen: {}:{}'.format(address, port))
+
+  try: 
+    httpd.serve_forever()
+  except KeyboardInterrupt:
+    exit(0)
+
+
+# ----
+if __name__ == '__main__':
+  main()

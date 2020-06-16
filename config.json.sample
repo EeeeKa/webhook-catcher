@@ -1,0 +1,36 @@
+{
+  "server": {
+    "address": "0.0.0.0",
+    "port": 8888,
+    "quiet": false,
+    "debug": false,
+    "wild_dir": "",
+    "wild_proto": "",
+    "wild_secret": "",
+    "self_update_repo": "webhook-catcher"
+  },
+
+  "repos": [
+    {
+      "name": "MyRepo",
+      "branch": "release",
+      "remote": "origin",
+      "dir": "/opt/myprog",
+      "action": "/opt/myprog-install.sh",
+      "clone_proto": "http",
+      "full_name": "Fat_and_Showels/myprog",
+      "secret": "SupP@sEckreTPhR@$e"    
+    },
+    {
+      "name": "MinimalRepo",
+      "dir": "/opt/minrepo",
+      "full_name": "USERNAME/min-rep"
+    },
+    {
+      "name": "webhook-catcher",
+      "dir": "./",
+      "full_name": "EeeeKa/webhook-catcher",
+      "secret": "UpdateSecret&#!"
+    }
+  ] 
+}
