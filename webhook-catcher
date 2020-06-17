@@ -150,10 +150,17 @@ class WebHookHandler(BaseHTTPRequestHandler):
       return
 
     # GET DATA
-    data_raw = self.rfile.read1(10240)
+    data_raw = b''
+    data_read_complete = False
 
-    ## Process data
-    data = json.loads(data_raw.decode('UTF-8'))
+    while not data_read_complete:
+      data_raw += self.rfile.read1(-1)
+      try:
+        data = json.loads(data_raw.decode('UTF-8'))
+      except:
+        pass
+      else:
+        data_read_complete = True
     
     try:
       requested_full_name = data['repository']['full_name'] 
@@ -209,7 +216,7 @@ class WebHookHandler(BaseHTTPRequestHandler):
       # CHECK SIGNATURE
       if current_repo['secret'] != '':
         if signature_type == 'Hub':
-          data_hash = hmac.new(current_repo['secret'].encode(), data_raw, hashlib.sha1).hexdigest()
+          data_hash = 'sha1=' + hmac.new(current_repo['secret'].encode(), data_raw, hashlib.sha1).hexdigest()
         elif signature_type == 'Gogs':
           data_hash = hmac.new(current_repo['secret'].encode(), data_raw, hashlib.sha256).hexdigest()
 
