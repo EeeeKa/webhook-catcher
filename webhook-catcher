@@ -67,6 +67,19 @@ DEFAULT_REMOTE = "origin"
 DEFAULT_BRANCH = "master"
 DEFAULT_PROTO = "http"
 
+# PARAMS
+# Python v3.7+
+if sys.version_info.major == 3 and sys.version_info[1] > 7:
+  READ_SIZE = -1
+# Python v3.5+
+elif sys.version_info.major == 3 and sys.version_info[1] > 5:
+  READ_SIZE = 20480
+# Fallback
+else:
+  READ_SIZE = 20480
+
+MAX_READ_ATTEMPTS = 10
+
 class WebHookServer(_HTTPServer):
 
   def __init__(self, server_address, request_handler_class, repos, self_update_repo, wild_dir, wild_proto, wild_secret):
@@ -152,9 +165,11 @@ class WebHookHandler(BaseHTTPRequestHandler):
     # GET DATA
     data_raw = b''
     data_read_complete = False
+    read_attempt = 0
 
-    while not data_read_complete:
-      data_raw += self.rfile.read1(-1)
+    while not data_read_complete and read_attempt < MAX_READ_ATTEMPTS:
+      read_attempt += 1
+      data_raw += self.rfile.read1(READ_SIZE)
       try:
         data = json.loads(data_raw.decode('UTF-8'))
       except:
