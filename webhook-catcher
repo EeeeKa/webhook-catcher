@@ -1,7 +1,7 @@
 #!/usr/bin/python3
 
 #
-# Webhook-catcher v1.1
+# Webhook-catcher v1.3
 #
 
 import os
@@ -32,7 +32,7 @@ from signal import signal, SIGHUP, SIGTERM
 from pprint import pprint
 
 PROG_NAME = "Webhook-catcher"
-PROG_VERSION = "v1.1"
+PROG_VERSION = "v1.3"
 PROG_DESCRIPTION = '\
   Simple HTTP-server for processing webhooks from Github or Gogs portals.\n\
   \n\
@@ -374,8 +374,17 @@ class WebHookWorker(object):
     if os.path.isdir(repo['dir']):
       result = subprocess.run([
           "git", "--git-dir", os.path.join(repo['dir'], '.git'), "--work-tree", repo['dir'], "pull",
-          repo['remote'], repo['branch'],
+          repo['remote'], repo['branch']
         ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+      if result.returncode == 0:
+        sub_result = subprocess.run([
+            "git", "--git-dir", os.path.join(repo['dir'], '.git'), "--work-tree", repo['dir'], "checkout",
+            repo['branch']
+          ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True)
+
+        result.stdout += sub_result.stdout
+        result.stderr += sub_result.stderr
+        result.returncode = sub_result.returncode
     else:
       result = subprocess.run([
           "git", "clone", "--origin", repo['remote'], "--branch", repo['branch'], repo['url'], repo['dir']
