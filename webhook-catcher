@@ -136,6 +136,8 @@ class WebHookHandler(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(json.dumps(self.json_response, indent=2, sort_keys=True).encode('UTF-8', 'replace'))
 
+  def log_message(self, format, *args):
+    pm("%s - - [%s] %s \n" % (self.address_string(), self.log_date_time_string(), format%args))
 
   def do_POST(self):
     # GET SIGNATURE
@@ -422,10 +424,12 @@ class MessagePrinter:
   def pm(self, message):
     if not self.quiet:
       print(message)
+      sys.stdout.flush()
 
   def pdm(self, debug_message):
     if self.debug:
       pprint(debug_message)
+      sys.stdout.flush()
 
 def load_config(path):
   if path != '':
