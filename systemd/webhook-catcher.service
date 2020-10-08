@@ -1,0 +1,12 @@
+[Unit]
+Description=Webhook catcher
+After=network.target
+
+[Service]
+User=whcd
+Group=whcd
+
+ExecStart=/usr/sbin/webhook-catcher -c /etc/webhook-catcher/config.json
+
+[Install]
+WantedBy=multi-user.target
